@@ -5,7 +5,7 @@ pub use crate::object::{Dictionary, Object, ObjectId, Stream, StringFormat};
 
 mod document;
 mod object_stream;
-mod xref;
+pub mod xref;
 pub use crate::document::Document;
 
 mod bookmarks;
@@ -24,6 +24,6 @@ mod parser;
 mod parser_aux;
 mod processor;
 mod reader;
-mod writer;
+pub mod writer;
 pub mod xobject;
 pub use error::{Error, Result};

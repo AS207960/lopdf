@@ -22,6 +22,9 @@ pub struct Document {
     /// The cross-reference table contains locations of the indirect objects.
     pub reference_table: Xref,
 
+    /// The position of the current cross-reference table start byte
+    pub reference_table_start: usize,
+
     /// The objects that make up the document contained in the file.
     pub objects: BTreeMap<ObjectId, Object>,
 
@@ -46,6 +49,7 @@ impl Document {
             version: "1.4".to_string(),
             trailer: Dictionary::new(),
             reference_table: Xref::new(0),
+            reference_table_start: 0,
             objects: BTreeMap::new(),
             max_id: 0,
             max_bookmark_id: 0,

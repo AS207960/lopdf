@@ -5,6 +5,7 @@ use std::path::Path;
 use super::Object::*;
 use super::{Dictionary, Document, Object, Stream, StringFormat};
 use crate::xref::*;
+use byteorder::{BigEndian, WriteBytesExt};
 
 impl Document {
     /// Save PDF document to specified file path.
@@ -30,14 +31,16 @@ impl Document {
         let mut xref = Xref::new(self.max_id + 1);
         writeln!(target, "%PDF-{}", self.version)?;
 
-        for (&(id, generation), object) in &self.objects {
+        let mut contents_map = Some(std::collections::btree_map::BTreeMap::<crate::ObjectId, (u32, u32)>::new());
+
+        for (&oid, object) in &self.objects {
             if object
                 .type_name()
                 .map(|name| ["ObjStm", "XRef", "Linearized"].contains(&name))
                 .ok()
                 != Some(true)
             {
-                Writer::write_indirect_object(&mut target, id, generation, object, &mut xref)?;
+                contents_map = Writer::write_indirect_object(&mut target, oid, object, &mut xref, contents_map)?;
             }
         }
 
@@ -49,10 +52,10 @@ impl Document {
         Ok(())
     }
 
-    fn write_trailer(&mut self, file: &mut dyn Write) -> Result<()> {
+    fn write_trailer<W: Write>(&mut self, file: &mut CountingWrite<&mut W>) -> Result<()> {
         self.trailer.set("Size", i64::from(self.max_id + 1));
         file.write_all(b"trailer\n")?;
-        Writer::write_dictionary(file, &self.trailer)?;
+        Writer::write_dictionary(file, &self.trailer, None, None)?;
         Ok(())
     }
 }
@@ -71,69 +74,174 @@ impl Writer {
         )
     }
 
-    fn write_xref(file: &mut dyn Write, xref: &Xref) -> Result<()> {
-        writeln!(file, "xref\n0 {}", xref.size)?;
+    pub fn write_xref(file: &mut dyn Write, xref: &Xref) -> Result<()> {
+        let mut start = 0;
+        let mut current = 1;
+        let mut entries: Vec<Option<&super::xref::XrefEntry>> = vec![];
 
-        let mut write_xref_entry =
-            |offset: u32, generation: u16, kind: char| writeln!(file, "{:>010} {:>05} {} ", offset, generation, kind);
-        write_xref_entry(0, 65535, 'f')?;
+        writeln!(file, "xref")?;
 
-        let mut obj_id = 1;
-        while obj_id < xref.size {
-            if let Some(entry) = xref.get(obj_id) {
-                if let XrefEntry::Normal { offset, generation } = *entry {
-                    write_xref_entry(offset, generation, 'n')?;
-                };
+        let mut output_entries = |start: u32, entries: &mut Vec<Option<&super::xref::XrefEntry>>| -> Result<()> {
+            let len = if start == 0 {
+                entries.len() + 1
             } else {
+                entries.len()
+            };
+            writeln!(file, "{} {}", start, len)?;
+
+            let mut write_xref_entry =
+                |offset: u32, generation: u16, kind: char| writeln!(file, "{:>010} {:>05} {} ", offset, generation, kind);
+
+            if start == 0 {
                 write_xref_entry(0, 65535, 'f')?;
             }
-            obj_id += 1;
+            for entry in entries.drain(..) {
+                if let Some(entry) = entry {
+                    if let XrefEntry::Normal { offset, generation } = *entry {
+                        write_xref_entry(offset, generation, 'n')?;
+                    };
+                } else {
+                    write_xref_entry(0, 65535, 'f')?;
+                }
+            }
+            Ok(())
+        };
+
+        let mut keys = xref.entries.keys().collect::<Vec<_>>();
+        keys.sort();
+        for oid in keys {
+            if *oid != current {
+                output_entries(start, &mut entries)?;
+                start = *oid;
+                current = *oid;
+            }
+            entries.push(xref.get(*oid));
+            current += 1;
         }
+        output_entries(start, &mut entries)?;
         Ok(())
     }
 
-    fn write_indirect_object<W: Write>(
-        file: &mut CountingWrite<&mut W>, id: u32, generation: u16, object: &Object, xref: &mut Xref,
-    ) -> Result<()> {
+    pub fn write_xref_stream(xref: &Xref) -> (Vec<u8>, Vec<(i64, i64)>) {
+        let mut start = 0;
+        let mut current = 1;
+        let mut entries: Vec<Option<&super::xref::XrefEntry>> = vec![];
+        let mut out = vec![];
+        let mut indices = vec![];
+
+        let mut output_entries = |start: u32, entries: &mut Vec<Option<&super::xref::XrefEntry>>| {
+            let len = if start == 0 {
+                entries.len() + 1
+            } else {
+                entries.len()
+            };
+            indices.push((start as i64, len as i64));
+
+            let mut write_xref_entry = |offset: u32, generation: u16, kind: u8| {
+                out.write_u8(kind).unwrap();
+                out.write_u32::<BigEndian>(offset).unwrap();
+                out.write_u16::<BigEndian>(generation).unwrap();
+            };
+
+            if start == 0 {
+                write_xref_entry(0, 65535, 0);
+            }
+            for entry in entries.drain(..) {
+                if let Some(entry) = entry {
+                    match entry {
+                        XrefEntry::Normal { offset, generation } => {
+                            write_xref_entry(*offset, *generation, 1);
+                        }
+                        XrefEntry::Compressed { container, index } => {
+                            write_xref_entry(*container, *index, 2);
+                        }
+                        XrefEntry::Free => {}
+                    }
+                } else {
+                    write_xref_entry(0, 65535, 0);
+                }
+            }
+        };
+
+        let mut keys = xref.entries.keys().collect::<Vec<_>>();
+        keys.sort();
+        for oid in keys {
+            if *oid != current {
+                output_entries(start, &mut entries);
+                start = *oid;
+                current = *oid;
+            }
+            entries.push(xref.get(*oid));
+            current += 1;
+        }
+        output_entries(start, &mut entries);
+
+        (out, indices)
+    }
+
+    pub fn write_indirect_object<W: Write>(
+        file: &mut CountingWrite<&mut W>, oid: crate::ObjectId, object: &Object, xref: &mut Xref,
+        contents_map: Option<std::collections::btree_map::BTreeMap<crate::ObjectId, (u32, u32)>>
+    ) -> Result<Option<std::collections::btree_map::BTreeMap<crate::ObjectId, (u32, u32)>>> {
         let offset = file.bytes_written as u32;
-        xref.insert(id, XrefEntry::Normal { offset, generation });
+        xref.insert(oid.0, XrefEntry::Normal { offset, generation: oid.1 });
         write!(
             file,
             "{} {} obj{}",
-            id,
-            generation,
+            oid.0,
+            oid.1,
             if Writer::need_separator(object) { " " } else { "" }
         )?;
-        Writer::write_object(file, object)?;
+        let contents_map = Writer::write_object(file, object, Some(oid), contents_map)?;
         writeln!(
             file,
             "{}endobj",
             if Writer::need_end_separator(object) { " " } else { "" }
         )?;
-        Ok(())
+        Ok(contents_map)
     }
 
-    pub fn write_object(file: &mut dyn Write, object: &Object) -> Result<()> {
+    pub fn write_object<W: Write>(
+        file: &mut CountingWrite<&mut W>, object: &Object, oid: Option<crate::ObjectId>,
+        contents_map: Option<std::collections::btree_map::BTreeMap<crate::ObjectId, (u32, u32)>>
+    ) -> Result<Option<std::collections::btree_map::BTreeMap<crate::ObjectId, (u32, u32)>>> {
         match *object {
-            Null => file.write_all(b"null"),
+            Null => {
+                file.write_all(b"null")?;
+                Ok(contents_map)
+            },
             Boolean(ref value) => {
                 if *value {
-                    file.write_all(b"true")
+                    file.write_all(b"true")?;
                 } else {
-                    file.write_all(b"false")
+                    file.write_all(b"false")?;
                 }
+                Ok(contents_map)
             }
             Integer(ref value) => {
                 let mut buf = itoa::Buffer::new();
-                file.write_all(buf.format(*value).as_bytes())
+                file.write_all(buf.format(*value).as_bytes())?;
+                Ok(contents_map)
             }
-            Real(ref value) => write!(file, "{}", value),
-            Name(ref name) => Writer::write_name(file, name),
-            String(ref text, ref format) => Writer::write_string(file, text, format),
-            Array(ref array) => Writer::write_array(file, array),
-            Object::Dictionary(ref dict) => Writer::write_dictionary(file, dict),
-            Object::Stream(ref stream) => Writer::write_stream(file, stream),
-            Reference(ref id) => write!(file, "{} {} R", id.0, id.1),
+            Real(ref value) => {
+                write!(file, "{}", value)?;
+                Ok(contents_map)
+            },
+            Name(ref name) => {
+                Writer::write_name(file, name)?;
+                Ok(contents_map)
+            },
+            String(ref text, ref format) => {
+                Writer::write_string(file, text, format)?;
+                Ok(contents_map)
+            },
+            Array(ref array) => Writer::write_array(file, array, oid, contents_map),
+            Object::Dictionary(ref dict) => Writer::write_dictionary(file, dict, oid, contents_map),
+            Object::Stream(ref stream) => Writer::write_stream(file, stream, oid, contents_map),
+            Reference(ref id) => {
+                write!(file, "{} {} R", id.0, id.1)?;
+                Ok(contents_map)
+            },
         }
     }
 
@@ -203,7 +311,10 @@ impl Writer {
         Ok(())
     }
 
-    fn write_array(file: &mut dyn Write, array: &[Object]) -> Result<()> {
+    pub fn write_array<W: Write>(
+        file: &mut CountingWrite<&mut W>, array: &[Object], oid: Option<crate::ObjectId>,
+        mut contents_map: Option<std::collections::btree_map::BTreeMap<crate::ObjectId, (u32, u32)>>
+    ) -> Result<Option<std::collections::btree_map::BTreeMap<crate::ObjectId, (u32, u32)>>> {
         file.write_all(b"[")?;
         let mut first = true;
         for object in array {
@@ -212,37 +323,52 @@ impl Writer {
             } else if Writer::need_separator(object) {
                 file.write_all(b" ")?;
             }
-            Writer::write_object(file, object)?;
+            contents_map = Writer::write_object(file, object, oid, contents_map)?;
         }
         file.write_all(b"]")?;
-        Ok(())
+        Ok(contents_map)
     }
 
-    fn write_dictionary(file: &mut dyn Write, dictionary: &Dictionary) -> Result<()> {
+    pub fn write_dictionary<W: Write>(
+        file: &mut CountingWrite<&mut W>, dictionary: &Dictionary, oid: Option<crate::ObjectId>,
+        mut contents_map: Option<std::collections::btree_map::BTreeMap<crate::ObjectId, (u32, u32)>>
+    ) -> Result<Option<std::collections::btree_map::BTreeMap<crate::ObjectId, (u32, u32)>>> {
         file.write_all(b"<<")?;
         for (key, value) in dictionary {
             Writer::write_name(file, key)?;
             if Writer::need_separator(value) {
                 file.write_all(b" ")?;
             }
-            Writer::write_object(file, value)?;
+            let start = file.bytes_written as u32;
+            contents_map = Writer::write_object(file, value, oid, contents_map)?;
+            if key == b"Contents" {
+                match (oid, &mut contents_map) {
+                    (Some(oid), Some(ref mut contents_map)) => {
+                        contents_map.insert(oid, (start, file.bytes_written as u32));
+                    },
+                    _ => {}
+                }
+            }
         }
         file.write_all(b">>")?;
-        Ok(())
+        Ok(contents_map)
     }
 
-    fn write_stream(file: &mut dyn Write, stream: &Stream) -> Result<()> {
-        Writer::write_dictionary(file, &stream.dict)?;
+    pub fn write_stream<W: Write>(
+        file: &mut CountingWrite<&mut W>, stream: &Stream, oid: Option<crate::ObjectId>,
+        mut contents_map: Option<std::collections::btree_map::BTreeMap<crate::ObjectId, (u32, u32)>>
+    ) -> Result<Option<std::collections::btree_map::BTreeMap<crate::ObjectId, (u32, u32)>>> {
+        contents_map = Writer::write_dictionary(file, &stream.dict, oid, contents_map)?;
         file.write_all(b"stream\n")?;
         file.write_all(&stream.content)?;
         file.write_all(b"endstream")?;
-        Ok(())
+        Ok(contents_map)
     }
 }
 
 pub struct CountingWrite<W: Write> {
-    inner: W,
-    bytes_written: usize,
+    pub inner: W,
+    pub bytes_written: usize,
 }
 
 impl<W: Write> Write for CountingWrite<W> {

@@ -26,15 +26,19 @@ pub struct Content<Operations: AsRef<[Operation]> = Vec<Operation>> {
 impl<Operations: AsRef<[Operation]>> Content<Operations> {
     /// Encode content operations.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut buffer = Vec::new();
+        let mut inner_buffer = vec![];
+        let mut buffer = super::writer::CountingWrite {
+            inner: &mut inner_buffer,
+            bytes_written: 0
+        };
         for operation in self.operations.as_ref() {
             for operand in &operation.operands {
-                Writer::write_object(&mut buffer, operand)?;
+                Writer::write_object(&mut buffer, operand, None, None)?;
                 buffer.write_all(b" ")?;
             }
             buffer.write_all(operation.operator.as_bytes())?;
             buffer.write_all(b"\n")?;
         }
-        Ok(buffer)
+        Ok(inner_buffer)
     }
 }

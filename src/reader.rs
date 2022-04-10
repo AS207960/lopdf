@@ -81,6 +81,7 @@ impl<'a> Reader<'a> {
         if xref_start > self.buffer.len() {
             return Err(Error::Xref(XrefError::Start));
         }
+        self.document.reference_table_start = xref_start;
 
         let (mut xref, mut trailer) = parser::xref_and_trailer(&self.buffer[xref_start..], &self)?;
 
@@ -326,13 +327,13 @@ endstream endobj\n",
     let doc = format!(
         "{}xref
 0 7
-0000000000 65535 f 
-0000000009 00000 n 
-0000000096 00000 n 
-0000000155 00000 n 
-0000000291 00000 n 
-0000000191 00000 n 
-0000000248 00000 n 
+0000000000 65535 f
+0000000009 00000 n
+0000000096 00000 n
+0000000155 00000 n
+0000000291 00000 n
+0000000191 00000 n
+0000000248 00000 n
 trailer
 <</Root 6 0 R/Size 7>>
 startxref
@@ -377,14 +378,14 @@ endstream endobj\n",
     let doc = format!(
         "{}xref
 0 7
-0000000000 65535 f 
-0000000009 00000 n 
-0000000096 00000 n 
-0000000155 00000 n 
-0000000387 00000 n 
-0000000191 00000 n 
-0000000254 00000 n 
-0000000297 00000 n 
+0000000000 65535 f
+0000000009 00000 n
+0000000096 00000 n
+0000000155 00000 n
+0000000387 00000 n
+0000000191 00000 n
+0000000254 00000 n
+0000000297 00000 n
 trailer
 <</Root 6 0 R/Size 7>>
 startxref
